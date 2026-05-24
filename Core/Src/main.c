@@ -46,6 +46,7 @@
 /* USER CODE BEGIN Includes */
 #include "motor.h"
 #include "sensor.h"
+#include "encoder.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>  // atoi
@@ -106,6 +107,17 @@ int main(void)
 
   /* USER CODE BEGIN 2 */
   Motor_Init();
+  Encoder_Init();
+  char clk_msg[128];
+
+snprintf(clk_msg, sizeof(clk_msg),
+    "SYSCLK=%lu HCLK=%lu PCLK1=%lu PCLK2=%lu\r\n",
+     HAL_RCC_GetSysClockFreq(),
+     HAL_RCC_GetHCLKFreq(),
+     HAL_RCC_GetPCLK1Freq(),
+     HAL_RCC_GetPCLK2Freq());
+
+HAL_UART_Transmit(&huart1, (uint8_t*)clk_msg, strlen(clk_msg), 1000);
 
   // 记录启动时间，防止上电后立即触发超时停车
   last_rx_tick = HAL_GetTick();
@@ -174,11 +186,13 @@ int main(void)
         current_left_speed  = lspd;
         current_right_speed = rspd;
 
+        Encoder_Update();
         HAL_Delay(20);
     }
     // -------- 手动模式/空闲 --------
     else
     {
+        Encoder_Update();
         HAL_Delay(20);
     }
 
@@ -339,16 +353,19 @@ static void send_status(void)
 {
     uint8_t  sensor_raw = Read_8Way_Sensor();
     float    error      = Get_Tracking_Error();
+    int32_t  enc_l      = Encoder_GetLeft();
+    int32_t  enc_r      = Encoder_GetRight();
 
-    // 构造帧内容（不含帧头$和帧尾\r\n）
-    char body[48];
+    char body[64];
     int body_len = snprintf(body, sizeof(body),
-        "S%d,%d,%d,%02X,%.2f#",
+        "S%d,%d,%d,%02X,%.2f,%ld,%ld#",
         work_mode,
         current_left_speed,
         current_right_speed,
         sensor_raw,
-        error
+        error,
+        enc_l,
+        enc_r
     );
 
     // 计算校验：'$' 异或 body 所有字节（含末尾的#）
@@ -387,6 +404,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             process_frame(rx_buf, rx_idx);
             rx_idx = 0;
         }
+        else if (byte == '\r') {
+            // 忽略 \r，兼容 \r\n 结尾的串口助手
+        }
         else {
             // 普通数据字节，写入缓冲区
             if (rx_idx < RX_BUF_SIZE - 1) {
@@ -405,20 +425,41 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 /* USER CODE END 4 */
 
 /**
-  * @brief 系统时钟配置，从 8MHz 外部晶振 (HSE) 倍频到 72MHz
+  * @brief 系统时钟配置，HSE 8MHz → PLL → 72MHz (F411CEU6)
+  *
+  * PLL 参数推导：
+  *   VCO 输入 = HSE / PLLM = 8MHz / 8 = 1MHz
+  *   VCO 输出 = VCO输入 × PLLN = 1MHz × 144 = 144MHz
+  *   SYSCLK   = VCO输出 / PLLP = 144MHz / 2 = 72MHz
+  *   USB时钟  = VCO输出 / PLLQ = 144MHz / 3 = 48MHz（USB 固定需要 48MHz）
+  *
+  * 总线时钟：
+  *   AHB  (HCLK)  = SYSCLK / 1 = 72MHz
+  *   APB1 (PCLK1) = HCLK   / 2 = 36MHz（APB1 最大 50MHz，满足）
+  *   APB2 (PCLK2) = HCLK   / 1 = 72MHz
+  *
+  * Flash 延迟：72MHz 时需要 2 个等待周期（FLASH_LATENCY_2），
+  * 等待周期不够会导致 CPU 读到错误指令，是常见的上电死机原因。
+  *
+  * 电压档位：SCALE2（1.2V 内核电压）支持最高 84MHz，72MHz 完全够用，
+  * 比 SCALE1 省电。
   */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    RCC_OscInitStruct.OscillatorType  = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState        = RCC_HSE_ON;
-    RCC_OscInitStruct.HSEPredivValue  = RCC_HSE_PREDIV_DIV1;
-    RCC_OscInitStruct.HSIState        = RCC_HSI_ON;
-    RCC_OscInitStruct.PLL.PLLState    = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource   = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLMUL      = RCC_PLL_MUL9; // 8MHz * 9 = 72MHz
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 8;              // HSE 8MHz / 8 = 1MHz VCO 输入（板载 8MHz 晶振）
+    RCC_OscInitStruct.PLL.PLLN       = 144;             // 1MHz × 144 = 144MHz VCO
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;  // 144 / 2 = 72MHz SYSCLK
+    RCC_OscInitStruct.PLL.PLLQ       = 3;              // 144 / 3 = 48MHz USB
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
         Error_Handler();
     }
@@ -426,9 +467,9 @@ void SystemClock_Config(void)
     RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
                                      | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
     RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;  // HCLK  = 72MHz
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;    // APB1  = 36MHz
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;    // APB2  = 72MHz
     if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
         Error_Handler();
     }
